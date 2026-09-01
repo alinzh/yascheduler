@@ -109,7 +109,7 @@ class CloudAPIManager:
     async def get_capacity(self) -> dict[str, CloudCapacity]:
         data: dict[str, CloudCapacity] = {}
         for name, count in (await self.db.count_nodes_clouds()).items():
-            api = self.apis.get("name")
+            api = self.apis.get(name)
             data[name] = CloudCapacity(
                 name=name,
                 current=count,
@@ -162,6 +162,14 @@ class CloudAPIManager:
         self, want_platforms: Optional[Sequence[str]] = None, throttle: bool = False
     ) -> Optional[str]:
         """Allocate new node"""
+        # The whole creation (including the slow, multi-minute api.create_node()
+        # call) must stay under the lock: capacity checks in
+        # select_best_provider() only count nodes already committed to the DB,
+        # so releasing the lock before create_node() finishes leaves a window
+        # where two concurrent callers both see spare capacity and both start
+        # creating a node -- verified directly against Vultr (duplicate
+        # bare-metal machines created seconds apart, burning through the
+        # account's monthly fee limit).
         async with self.allocation_lock:
             api = await self.select_best_provider(want_platforms)
             if not api:
@@ -173,21 +181,21 @@ class CloudAPIManager:
 
             tmp_ip = await self.db.add_tmp_node(api.name, api.config.username)
             await self.db.commit()
-        try:
-            ip_addr = await api.create_node()
-        finally:
-            await self.db.remove_node(tmp_ip)
-            await self.db.commit()
+            try:
+                ip_addr = await api.create_node()
+            finally:
+                await self.db.remove_node(tmp_ip)
+                await self.db.commit()
 
-        _ = await self.db.add_node(
-            ip_addr=ip_addr,
-            username=api.config.username,
-            port=None,
-            cloud=api.name,
-            enabled=True,
-        )
-        await self.db.commit()
-        return ip_addr
+            _ = await self.db.add_node(
+                ip_addr=ip_addr,
+                username=api.config.username,
+                port=None,
+                cloud=api.name,
+                enabled=True,
+            )
+            await self.db.commit()
+            return ip_addr
 
     async def allocate(
         self,

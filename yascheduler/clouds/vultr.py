@@ -299,7 +299,22 @@ async def vultr_create_node(
     last_status: Optional[str] = None
     ip_addr: Optional[str] = None
     while asyncio.get_running_loop().time() < deadline:
-        data = await client.request("GET", f"/bare-metals/{instance_id}")
+        try:
+            data = await client.request("GET", f"/bare-metals/{instance_id}")
+        except APIError as err:
+            # Vultr's read path can lag just-created instances by a few
+            # seconds: an immediate GET right after the creating POST can
+            # 404 even though the (billed) instance already exists. Treat
+            # a 404 here as "not visible yet" and keep polling instead of
+            # failing the whole creation -- a hard failure here orphans the
+            # real instance (no ip_addr was ever learned, so nothing can
+            # clean it up) and yascheduler just creates another one,
+            # multiplying billed bare-metal machines on every such 404.
+            if "404" in str(err):
+                log.debug(f"Bare-metal {instance_id} not visible yet: {err}")
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
+            raise
         bm = data.get("bare_metal", data)
         status = bm.get("status", "")
         ip_addr = bm.get("main_ip", "")
